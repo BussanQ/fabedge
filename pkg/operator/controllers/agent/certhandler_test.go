@@ -37,7 +37,8 @@ var _ = Describe("CertHandler", func() {
 		certManager certutil.Manager
 		handler     *certHandler
 
-		newNode = newNodePodCIDRsInAnnotations
+		newNode         = newNodePodCIDRsInAnnotations
+		getEndpointName = func(nodeName string) string { return nodeName }
 	)
 
 	BeforeEach(func() {
@@ -47,26 +48,28 @@ var _ = Describe("CertHandler", func() {
 			IsCA:           true,
 			ValidityPeriod: timeutil.Days(365),
 		})
-		certManager, _ = certutil.NewManger(caCertDER, caKeyDER)
+		certManager, _ = certutil.NewManger(caCertDER, caKeyDER, timeutil.Days(365))
 		handler = &certHandler{
 			namespace:        namespace,
 			client:           k8sClient,
 			certManager:      certManager,
-			certValidPeriod:  365,
+			getEndpointName:  getEndpointName,
 			certOrganization: certutil.DefaultOrganization,
 			log:              klogr.New().WithName("configHandler"),
 		}
 
 		nodeName := getNodeName()
 		node = newNode(nodeName, "10.40.20.181", "2.2.1.128/26")
+		node.UID = "123456"
 
-		Expect(handler.Do(context.Background(), node)).Should(Succeed())
+		Expect(handler.Do(context.Background(), node)).Should(Equal(errRestartAgent))
 	})
 
 	It("should ensure a valid certificate and a private key for specified node's agent", func() {
 		var secret corev1.Secret
 		secretName := getCertSecretName(node.Name)
 		Expect(k8sClient.Get(context.Background(), ObjectKey{Namespace: namespace, Name: secretName}, &secret)).Should(Succeed())
+		expectOwnerReference(&secret, node)
 
 		By("Checking TLS secret")
 		caCertPEM, certPEM := secretutil.GetCACert(secret), secretutil.GetCert(secret)
@@ -74,8 +77,8 @@ var _ = Describe("CertHandler", func() {
 		Expect(caCertPEM).Should(Equal(certManager.GetCACertPEM()))
 
 		By("Changing TLS secret with expired cert")
-		certDER, keyDER, _ := certManager.SignCert(certutil.Config{
-			CommonName:     node.Name,
+		certDER, keyDER, _ := certManager.NewCertKey(certutil.Config{
+			CommonName:     getEndpointName(node.Name),
 			ValidityPeriod: time.Second,
 		})
 		secret.Data[corev1.TLSCertKey] = certutil.EncodeCertPEM(certDER)
@@ -84,11 +87,12 @@ var _ = Describe("CertHandler", func() {
 
 		time.Sleep(time.Second)
 
-		Expect(handler.Do(context.Background(), node)).Should(Succeed())
+		Expect(handler.Do(context.Background(), node)).Should(Equal(errRestartAgent))
 
 		By("Checking if TLS secret updated")
 		secret = corev1.Secret{}
 		Expect(k8sClient.Get(context.Background(), ObjectKey{Namespace: namespace, Name: secretName}, &secret)).Should(Succeed())
+		expectOwnerReference(&secret, node)
 
 		caCertPEM, certPEM = secretutil.GetCACert(secret), secretutil.GetCert(secret)
 		Expect(certManager.VerifyCertInPEM(certPEM, certutil.ExtKeyUsagesServerAndClient)).Should(Succeed())

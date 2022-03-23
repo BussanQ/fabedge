@@ -22,12 +22,14 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/fabedge/fabedge/pkg/common/constants"
+	"github.com/fabedge/fabedge/pkg/operator/types"
 	certutil "github.com/fabedge/fabedge/pkg/util/cert"
 	secretutil "github.com/fabedge/fabedge/pkg/util/secret"
-	timeutil "github.com/fabedge/fabedge/pkg/util/time"
 )
 
 var _ Handler = &certHandler{}
@@ -35,9 +37,9 @@ var _ Handler = &certHandler{}
 type certHandler struct {
 	namespace string
 
+	getEndpointName  types.GetNameFunc
 	certManager      certutil.Manager
 	certOrganization string
-	certValidPeriod  int64
 
 	client client.Client
 	log    logr.Logger
@@ -64,12 +66,18 @@ func (handler *certHandler) Do(ctx context.Context, node corev1.Node) error {
 			return err
 		}
 
+		if err = controllerutil.SetControllerReference(&node, &secret, scheme.Scheme); err != nil {
+			log.Error(err, "failed to set ownerReference to TLS secret")
+			return err
+		}
+
 		err = handler.client.Create(ctx, &secret)
 		if err != nil {
 			log.Error(err, "failed to create secret")
+			return err
 		}
 
-		return err
+		return errRestartAgent
 	}
 
 	certPEM := secretutil.GetCert(secret)
@@ -86,21 +94,29 @@ func (handler *certHandler) Do(ctx context.Context, node corev1.Node) error {
 		return err
 	}
 
-	err = handler.client.Update(ctx, &secret)
-	if err != nil {
-		log.Error(err, "failed to save secret")
+	if err = controllerutil.SetControllerReference(&node, &secret, scheme.Scheme); err != nil {
+		log.Error(err, "failed to set ownerReference to TLS secret")
+		return err
 	}
 
-	return err
+	if err = handler.client.Update(ctx, &secret); err != nil {
+		log.Error(err, "failed to save secret")
+		return err
+	}
+
+	return errRestartAgent
 }
 
 func (handler *certHandler) buildCertAndKeySecret(secretName string, node corev1.Node) (corev1.Secret, error) {
-	certDER, keyDER, err := handler.certManager.SignCert(certutil.Config{
-		CommonName:     node.Name,
-		Organization:   []string{handler.certOrganization},
-		ValidityPeriod: timeutil.Days(handler.certValidPeriod),
-		Usages:         certutil.ExtKeyUsagesServerAndClient,
+	keyDER, csr, err := certutil.NewCertRequest(certutil.Request{
+		CommonName:   handler.getEndpointName(node.Name),
+		Organization: []string{handler.certOrganization},
 	})
+	if err != nil {
+		return corev1.Secret{}, err
+	}
+
+	certDER, err := handler.certManager.SignCert(csr)
 	if err != nil {
 		return corev1.Secret{}, err
 	}

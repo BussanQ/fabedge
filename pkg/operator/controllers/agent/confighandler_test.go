@@ -17,14 +17,15 @@ package agent
 import (
 	"context"
 
-	"github.com/jjeffery/stringset"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/klog/v2/klogr"
 
+	apis "github.com/fabedge/fabedge/pkg/apis/v1alpha1"
 	"github.com/fabedge/fabedge/pkg/common/netconf"
 	storepkg "github.com/fabedge/fabedge/pkg/operator/store"
 	"github.com/fabedge/fabedge/pkg/operator/types"
@@ -38,42 +39,48 @@ var _ = Describe("ConfigHandler", func() {
 
 		node corev1.Node
 
-		connectorEndpoint, edge2Endpoint types.Endpoint
+		connectorEndpoint, edge2Endpoint apis.Endpoint
 		testCommunity                    types.Community
 
-		newEndpoint = types.GenerateNewEndpointFunc("C=CN, O=StrongSwan, CN={node}", nodeutil.GetPodCIDRsFromAnnotation)
-		newNode     = newNodePodCIDRsInAnnotations
+		getEndpointName types.GetNameFunc
+		newEndpoint     types.NewEndpointFunc
+		newNode         = newNodePodCIDRsInAnnotations
 
 		handler *configHandler
 		store   storepkg.Interface
 	)
 
 	BeforeEach(func() {
+		getEndpointName, _, newEndpoint = types.NewEndpointFuncs("cluster", "C=CN, O=StrongSwan, CN={node}", nodeutil.GetPodCIDRsFromAnnotation)
+
 		store = storepkg.NewStore()
 		handler = &configHandler{
 			namespace:            namespace,
 			client:               k8sClient,
 			store:                store,
+			getEndpointName:      getEndpointName,
 			getConnectorEndpoint: getConnectorEndpoint,
 			log:                  klogr.New().WithName("configHandler"),
 		}
 
 		nodeName := getNodeName()
 		connectorEndpoint = getConnectorEndpoint()
-		edge2Endpoint = types.Endpoint{
+		edge2Endpoint = apis.Endpoint{
 			ID:              "C=CN, O=StrongSwan, CN=edge2",
 			Name:            "edge2",
 			PublicAddresses: []string{"10.20.8.141"},
 			Subnets:         []string{"2.2.1.65/26"},
 			NodeSubnets:     []string{"10.20.8.141"},
+			Type:            apis.EdgeNode,
 		}
 		testCommunity = types.Community{
 			Name:    "test",
-			Members: stringset.New(edge2Endpoint.Name, nodeName),
+			Members: sets.NewString(edge2Endpoint.Name, getEndpointName(nodeName)),
 		}
 
 		agentConfigName = getAgentConfigMapName(nodeName)
 		node = newNode(nodeName, "10.40.20.181", "2.2.1.128/26")
+		node.UID = "123456"
 
 		store.SaveEndpoint(edge2Endpoint)
 		store.SaveEndpoint(newEndpoint(node))
@@ -86,6 +93,7 @@ var _ = Describe("ConfigHandler", func() {
 		var cm corev1.ConfigMap
 		err := k8sClient.Get(context.Background(), ObjectKey{Name: agentConfigName, Namespace: namespace}, &cm)
 		Expect(err).ShouldNot(HaveOccurred())
+		expectOwnerReference(&cm, node)
 
 		configData, ok := cm.Data[agentConfigServicesFileName]
 		Expect(ok).Should(BeTrue())
@@ -98,13 +106,16 @@ var _ = Describe("ConfigHandler", func() {
 		Expect(yaml.Unmarshal([]byte(configData), &conf)).ShouldNot(HaveOccurred())
 
 		expectedConf := netconf.NetworkConf{
-			TunnelEndpoint: newEndpoint(node).ConvertToTunnelEndpoint(),
-			Peers: []netconf.TunnelEndpoint{
-				connectorEndpoint.ConvertToTunnelEndpoint(),
-				edge2Endpoint.ConvertToTunnelEndpoint(),
+			Endpoint: newEndpoint(node),
+			Peers: []apis.Endpoint{
+				connectorEndpoint,
+				edge2Endpoint,
 			},
 		}
 		Expect(conf).Should(Equal(expectedConf))
+		Expect(conf).Should(Equal(expectedConf))
+		Expect(conf.Peers[0].Type).Should(Equal(apis.Connector))
+		Expect(conf.Peers[1].Type).Should(Equal(apis.EdgeNode))
 	})
 
 	It("Do should update agent configmap when any endpoint changed", func() {
@@ -128,6 +139,7 @@ var _ = Describe("ConfigHandler", func() {
 		var cm corev1.ConfigMap
 		err := k8sClient.Get(context.Background(), ObjectKey{Name: agentConfigName, Namespace: namespace}, &cm)
 		Expect(err).ShouldNot(HaveOccurred())
+		expectOwnerReference(&cm, node)
 
 		configData, ok := cm.Data[agentConfigTunnelFileName]
 		Expect(ok).Should(BeTrue())
@@ -136,10 +148,10 @@ var _ = Describe("ConfigHandler", func() {
 		Expect(yaml.Unmarshal([]byte(configData), &conf)).ShouldNot(HaveOccurred())
 
 		expectedConf := netconf.NetworkConf{
-			TunnelEndpoint: newEndpoint(node).ConvertToTunnelEndpoint(),
-			Peers: []netconf.TunnelEndpoint{
-				connectorEndpoint.ConvertToTunnelEndpoint(),
-				edge2Endpoint.ConvertToTunnelEndpoint(),
+			Endpoint: newEndpoint(node),
+			Peers: []apis.Endpoint{
+				connectorEndpoint,
+				edge2Endpoint,
 			},
 		}
 		Expect(conf).Should(Equal(expectedConf))
@@ -155,12 +167,13 @@ var _ = Describe("ConfigHandler", func() {
 	})
 })
 
-func getConnectorEndpoint() types.Endpoint {
-	return types.Endpoint{
+func getConnectorEndpoint() apis.Endpoint {
+	return apis.Endpoint{
 		ID:              "C=CN, O=StrongSwan, CN=cloud-connector",
 		Name:            "cloud-connector",
 		PublicAddresses: []string{"192.168.1.1"},
 		Subnets:         []string{"2.2.1.1/26"},
 		NodeSubnets:     []string{"192.168.1.0/24"},
+		Type:            apis.Connector,
 	}
 }

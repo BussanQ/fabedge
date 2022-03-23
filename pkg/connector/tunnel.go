@@ -17,13 +17,14 @@ package connector
 import (
 	"k8s.io/klog/v2"
 
+	"github.com/fabedge/fabedge/pkg/apis/v1alpha1"
 	"github.com/fabedge/fabedge/pkg/common/netconf"
 	"github.com/fabedge/fabedge/pkg/tunnel"
-	"github.com/jjeffery/stringset"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 var (
-	connNames stringset.Set
+	connNames sets.String
 )
 
 func (m *Manager) readCfgFromFile() error {
@@ -33,7 +34,7 @@ func (m *Manager) readCfgFromFile() error {
 	}
 
 	m.connections = nil
-	connNames = stringset.New()
+	connNames = sets.NewString()
 
 	for _, peer := range nc.Peers {
 
@@ -45,25 +46,19 @@ func (m *Manager) readCfgFromFile() error {
 			LocalAddress:     nc.PublicAddresses,
 			LocalSubnets:     nc.Subnets,
 			LocalNodeSubnets: nc.NodeSubnets,
+			LocalType:        nc.Type,
 
 			RemoteID:          peer.ID,
 			RemoteAddress:     peer.PublicAddresses,
 			RemoteSubnets:     peer.Subnets,
 			RemoteNodeSubnets: peer.NodeSubnets,
+			RemoteType:        peer.Type,
 		}
 		m.connections = append(m.connections, con)
-		connNames.Add(con.Name)
+		connNames.Insert(con.Name)
 	}
 
 	return nil
-}
-
-// remote local and remote address to support IPSec NAT_T
-func removeLocalAndRemoteAddress(conn tunnel.ConnConfig) tunnel.ConnConfig {
-	c := conn
-	c.LocalAddress = nil
-	c.RemoteAddress = nil
-	return c
 }
 
 func (m *Manager) syncConnections() error {
@@ -80,7 +75,7 @@ func (m *Manager) syncConnections() error {
 
 	// remove inactive connections
 	for _, name := range oldNames {
-		if !connNames.Contains(name) {
+		if !connNames.Has(name) {
 			if err = m.tm.UnloadConn(name); err != nil {
 				return err
 			}
@@ -89,8 +84,23 @@ func (m *Manager) syncConnections() error {
 
 	// load active connections
 	for _, c := range m.connections {
-		if err = m.tm.LoadConn(removeLocalAndRemoteAddress(c)); err != nil {
-			return err
+		switch c.RemoteType {
+		case v1alpha1.EdgeNode:
+			c.LocalAddress = nil  // we do not care local ip address
+			c.RemoteAddress = nil // we just wait the connection from remote edge nodes
+			if err = m.tm.LoadConn(c); err != nil {
+				klog.Errorf("failed to load connection:%s", err)
+			}
+		case v1alpha1.Connector:
+			c.LocalAddress = nil // we do not care local ip address
+			if err = m.tm.LoadConn(c); err != nil {
+				klog.Errorf("failed to load connection:%s", err)
+			}
+			if err = m.tm.InitiateConn(c.Name); err != nil {
+				klog.Errorf("failed to initiate connection:%s", err)
+			}
+		default:
+			klog.Errorf("connection type:%s is not implemented", c.RemoteType)
 		}
 	}
 

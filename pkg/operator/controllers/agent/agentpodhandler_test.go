@@ -42,19 +42,22 @@ var _ = Describe("AgentPodHandler", func() {
 
 	BeforeEach(func() {
 		handler = &agentPodHandler{
-			namespace:       namespace,
-			agentImage:      agentImage,
-			strongswanImage: strongswanImage,
-			imagePullPolicy: corev1.PullIfNotPresent,
-			logLevel:        3,
-			client:          k8sClient,
-			log:             klogr.New().WithName("agentPodHandler"),
-			enableIPAM:      true,
+			namespace:         namespace,
+			agentImage:        agentImage,
+			strongswanImage:   strongswanImage,
+			imagePullPolicy:   corev1.PullIfNotPresent,
+			logLevel:          3,
+			client:            k8sClient,
+			log:               klogr.New().WithName("agentPodHandler"),
+			enableIPAM:        true,
+			enableHairpinMode: true,
+			networkPluginMTU:  1400,
 		}
 
 		nodeName := getNodeName()
 		agentPodName = getAgentPodName(nodeName)
 		node = newNode(nodeName, "10.40.20.181", "2.2.2.2/26")
+		node.UID = "123456"
 
 		Expect(handler.Do(context.TODO(), node)).To(Succeed())
 	})
@@ -64,6 +67,7 @@ var _ = Describe("AgentPodHandler", func() {
 		agentPodName := getAgentPodName(node.Name)
 		err := k8sClient.Get(context.Background(), ObjectKey{Namespace: namespace, Name: agentPodName}, &pod)
 		Expect(err).ShouldNot(HaveOccurred())
+		expectOwnerReference(&pod, node)
 
 		// pod
 		Expect(pod.Spec.NodeName).To(Equal(node.Name))
@@ -201,8 +205,8 @@ var _ = Describe("AgentPodHandler", func() {
 		Expect(pod.Spec.InitContainers[0].Command).To(ConsistOf("env_prepare.sh"))
 		Expect(*pod.Spec.InitContainers[0].SecurityContext.Privileged).To(BeTrue())
 
-		Expect(pod.Spec.Containers[0].Image).To(Equal(agentImage))
-		Expect(pod.Spec.Containers[0].ImagePullPolicy).To(Equal(handler.imagePullPolicy))
+		Expect(pod.Spec.InitContainers[0].Image).To(Equal(agentImage))
+		Expect(pod.Spec.InitContainers[0].ImagePullPolicy).To(Equal(handler.imagePullPolicy))
 
 		// agent container
 		Expect(pod.Spec.Containers[0].Name).To(Equal("agent"))
@@ -217,6 +221,8 @@ var _ = Describe("AgentPodHandler", func() {
 			"tls.crt",
 			"--masq-outgoing=false",
 			"--enable-ipam=true",
+			"--enable-hairpinmode=true",
+			"--network-plugin-mtu=1400",
 			"--use-xfrm=false",
 			"--enable-proxy=false",
 			"-v=3",
@@ -369,6 +375,8 @@ var _ = Describe("AgentPodHandler", func() {
 			"tls.crt",
 			"--masq-outgoing=false",
 			"--enable-ipam=false",
+			"--enable-hairpinmode=true",
+			"--network-plugin-mtu=1400",
 			"--use-xfrm=false",
 			"--enable-proxy=false",
 			"-v=3",
@@ -396,6 +404,15 @@ var _ = Describe("AgentPodHandler", func() {
 			},
 		}
 		Expect(pod.Spec.Containers[0].VolumeMounts).To(Equal(agentVolumeMounts))
+	})
+
+	It("should delete agent pod if errRestartAgent is passed in context", func() {
+		ctx := context.WithValue(context.Background(), keyRestartAgent, errRestartAgent)
+		Expect(handler.Do(ctx, node)).Should(Succeed())
+
+		pod := corev1.Pod{}
+		err := k8sClient.Get(context.Background(), ObjectKey{Namespace: namespace, Name: agentPodName}, &pod)
+		Expect(errors.IsNotFound(err) || pod.DeletionTimestamp != nil).Should(BeTrue())
 	})
 
 	It("should delete agent pod if is not matched to expected pod spec", func() {

@@ -17,15 +17,18 @@ package store
 import (
 	"sync"
 
+	apis "github.com/fabedge/fabedge/pkg/apis/v1alpha1"
 	"github.com/fabedge/fabedge/pkg/operator/types"
-	"github.com/jjeffery/stringset"
+	"k8s.io/apimachinery/pkg/util/sets"
 )
 
 type Interface interface {
-	SaveEndpoint(ep types.Endpoint)
-	GetEndpoint(name string) (types.Endpoint, bool)
-	GetEndpoints(names ...string) []types.Endpoint
-	GetAllEndpointNames() stringset.Set
+	SaveEndpoint(ep apis.Endpoint)
+	SaveEndpointAsLocal(ep apis.Endpoint)
+	GetEndpoint(name string) (apis.Endpoint, bool)
+	GetEndpoints(names ...string) []apis.Endpoint
+	GetAllEndpointNames() sets.String
+	GetLocalEndpointNames() sets.String
 	DeleteEndpoint(name string)
 
 	SaveCommunity(ep types.Community)
@@ -37,29 +40,39 @@ type Interface interface {
 var _ Interface = &store{}
 
 type store struct {
-	endpoints             map[string]types.Endpoint
+	localNameSet          sets.String
+	endpoints             map[string]apis.Endpoint
 	communities           map[string]types.Community
-	endpointToCommunities map[string]stringset.Set
+	endpointToCommunities map[string]sets.String
 
 	mux sync.RWMutex
 }
 
 func NewStore() Interface {
 	return &store{
-		endpoints:             make(map[string]types.Endpoint),
+		localNameSet:          sets.NewString(),
+		endpoints:             make(map[string]apis.Endpoint),
 		communities:           make(map[string]types.Community),
-		endpointToCommunities: make(map[string]stringset.Set),
+		endpointToCommunities: make(map[string]sets.String),
 	}
 }
 
-func (s *store) SaveEndpoint(ep types.Endpoint) {
+func (s *store) SaveEndpoint(ep apis.Endpoint) {
 	s.mux.Lock()
 	defer s.mux.Unlock()
 
 	s.endpoints[ep.Name] = ep
 }
 
-func (s *store) GetEndpoint(name string) (types.Endpoint, bool) {
+func (s *store) SaveEndpointAsLocal(ep apis.Endpoint) {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+
+	s.endpoints[ep.Name] = ep
+	s.localNameSet.Insert(ep.Name)
+}
+
+func (s *store) GetEndpoint(name string) (apis.Endpoint, bool) {
 	s.mux.Lock()
 	defer s.mux.Unlock()
 
@@ -67,11 +80,11 @@ func (s *store) GetEndpoint(name string) (types.Endpoint, bool) {
 	return ep, ok
 }
 
-func (s *store) GetEndpoints(names ...string) []types.Endpoint {
+func (s *store) GetEndpoints(names ...string) []apis.Endpoint {
 	s.mux.Lock()
 	defer s.mux.Unlock()
 
-	endpoints := make([]types.Endpoint, 0, len(names))
+	endpoints := make([]apis.Endpoint, 0, len(names))
 	for _, name := range names {
 		ep, ok := s.endpoints[name]
 		if !ok {
@@ -83,16 +96,28 @@ func (s *store) GetEndpoints(names ...string) []types.Endpoint {
 	return endpoints
 }
 
-func (s *store) GetAllEndpointNames() stringset.Set {
+func (s *store) GetAllEndpointNames() sets.String {
 	s.mux.Lock()
 	defer s.mux.Unlock()
 
-	names := make(stringset.Set, len(s.endpoints))
+	names := make(sets.String, len(s.endpoints))
 	for name := range s.endpoints {
-		names.Add(name)
+		names.Insert(name)
 	}
 
 	return names
+}
+
+func (s *store) GetLocalEndpointNames() sets.String {
+	s.mux.RLock()
+	defer s.mux.RUnlock()
+
+	nameSet := sets.NewString()
+	for name := range s.localNameSet {
+		nameSet.Insert(name)
+	}
+
+	return nameSet
 }
 
 func (s *store) DeleteEndpoint(name string) {
@@ -100,6 +125,7 @@ func (s *store) DeleteEndpoint(name string) {
 	defer s.mux.Unlock()
 
 	delete(s.endpoints, name)
+	s.localNameSet.Delete(name)
 }
 
 func (s *store) SaveCommunity(c types.Community) {
@@ -116,19 +142,23 @@ func (s *store) SaveCommunity(c types.Community) {
 	// add new member to communities index
 	for member := range c.Members {
 		cs := s.endpointToCommunities[member]
-		cs.Add(c.Name)
+		if cs == nil {
+			cs = sets.NewString()
+		}
+
+		cs.Insert(c.Name)
 
 		s.endpointToCommunities[member] = cs
 	}
 
 	// remove old member to communities index
 	for member := range oldCommunity.Members {
-		if c.Members.Contains(member) {
+		if c.Members.Has(member) {
 			continue
 		}
 
 		cs := s.endpointToCommunities[member]
-		cs.Remove(c.Name)
+		cs.Delete(c.Name)
 		if len(cs) == 0 {
 			delete(s.endpointToCommunities, member)
 		}
@@ -172,7 +202,7 @@ func (s *store) DeleteCommunity(name string) {
 	cmm := s.communities[name]
 	for member := range cmm.Members {
 		cs := s.endpointToCommunities[member]
-		cs.Remove(name)
+		cs.Delete(name)
 		if len(cs) == 0 {
 			delete(s.endpointToCommunities, member)
 		}

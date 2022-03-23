@@ -15,10 +15,11 @@
 package store_test
 
 import (
-	"github.com/jjeffery/stringset"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"k8s.io/apimachinery/pkg/util/sets"
 
+	apis "github.com/fabedge/fabedge/pkg/apis/v1alpha1"
 	storepkg "github.com/fabedge/fabedge/pkg/operator/store"
 	"github.com/fabedge/fabedge/pkg/operator/types"
 )
@@ -30,15 +31,15 @@ var _ = Describe("Store", func() {
 		store = storepkg.NewStore()
 	})
 
-	It("can support endpoint CRUD operations", func() {
-		e1 := types.Endpoint{
+	It("support endpoint CRUD operations", func() {
+		e1 := apis.Endpoint{
 			ID:              "edge1",
 			Name:            "edge1",
 			PublicAddresses: []string{"10.40.20.181"},
 			Subnets:         []string{"2.2.0.0/26"},
 		}
 
-		e2 := types.Endpoint{
+		e2 := apis.Endpoint{
 			ID:              "edge2",
 			Name:            "edge2",
 			PublicAddresses: []string{"10.40.20.182"},
@@ -46,35 +47,41 @@ var _ = Describe("Store", func() {
 		}
 
 		store.SaveEndpoint(e1)
-		store.SaveEndpoint(e2)
+		store.SaveEndpointAsLocal(e2)
 
 		e, ok := store.GetEndpoint(e1.Name)
 		Expect(ok).To(BeTrue())
 		Expect(e).To(Equal(e1))
 
-		names := store.GetAllEndpointNames()
-		endpoints := store.GetEndpoints(names.Values()...)
-		Expect(endpoints[0]).To(Equal(e1))
-		Expect(endpoints[1]).To(Equal(e2))
+		nameSet := store.GetAllEndpointNames()
+		Expect(nameSet.Has(e1.Name)).To(BeTrue())
+		Expect(nameSet.Has(e2.Name)).To(BeTrue())
+
+		nameSet = store.GetLocalEndpointNames()
+		Expect(nameSet.Has(e1.Name)).To(BeFalse())
+		Expect(nameSet.Has(e2.Name)).To(BeTrue())
 
 		endpoints2 := store.GetEndpoints(e1.Name, e2.Name)
 		Expect(endpoints2).To(ContainElement(e1))
 		Expect(endpoints2).To(ContainElement(e2))
 
-		store.DeleteEndpoint(e1.Name)
-		e, ok = store.GetEndpoint(e1.Name)
+		store.DeleteEndpoint(e2.Name)
+		e, ok = store.GetEndpoint(e2.Name)
 		Expect(ok).To(BeFalse())
 		Expect(e).NotTo(Equal(e1))
+
+		nameSet = store.GetLocalEndpointNames()
+		Expect(nameSet.Has(e2.Name)).To(BeFalse())
 	})
 
 	It("can support community CRUD operations", func() {
 		c1 := types.Community{
 			Name:    "nginx",
-			Members: stringset.New("edge1", "edge2"),
+			Members: sets.NewString("edge1", "edge2"),
 		}
 		c2 := types.Community{
 			Name:    "apache",
-			Members: stringset.New("edge1", "edge2", "edge3"),
+			Members: sets.NewString("edge1", "edge2", "edge3"),
 		}
 
 		store.SaveCommunity(c1)
@@ -94,7 +101,7 @@ var _ = Describe("Store", func() {
 
 		c2 = types.Community{
 			Name:    "apache",
-			Members: stringset.New("edge1", "edge3"),
+			Members: sets.NewString("edge1", "edge3"),
 		}
 		store.SaveCommunity(c2)
 		communities = store.GetCommunitiesByEndpoint("edge2")

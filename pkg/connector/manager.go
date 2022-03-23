@@ -15,13 +15,14 @@
 package connector
 
 import (
+	"encoding/json"
+	"github.com/fabedge/fabedge/pkg/util/memberlist"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/coreos/go-iptables/iptables"
-	"github.com/spf13/pflag"
 	"k8s.io/klog/v2"
 
 	"github.com/fabedge/fabedge/pkg/common/about"
@@ -38,6 +39,7 @@ type Manager struct {
 	connections []tunnel.ConnConfig
 	ipset       ipset.Interface
 	router      routing.Routing
+	mc          *memberlist.Client
 }
 
 type Config struct {
@@ -47,15 +49,13 @@ type Config struct {
 	CertFile         string
 	ViciSocket       string
 	CNIType          string
+	initMembers      []string
 }
 
-func (c *Config) AddFlags(fs *pflag.FlagSet) {
-	fs.StringVar(&c.TunnelConfigFile, "tunnel-config", "/etc/fabedge/tunnels.yaml", "tunnel config file")
-	fs.StringVar(&c.CertFile, "cert-file", "/etc/ipsec.d/certs/tls.crt", "TLS certificate file")
-	fs.StringVar(&c.ViciSocket, "vici-socket", "/var/run/charon.vici", "vici socket file")
-	fs.StringVar(&c.CNIType, "cni-type", "CALICO", "CNI type used in cloud")
-	fs.DurationVar(&c.SyncPeriod, "sync-period", 5*time.Minute, "period to sync routes/rules")
-	fs.DurationVar(&c.DebounceDuration, "debounce-duration", 5*time.Second, "period to sync routes/rules")
+func msgHandler(b []byte) {
+}
+
+func nodeLeveHandler(name string) {
 }
 
 func (c Config) Manager() (*Manager, error) {
@@ -77,12 +77,18 @@ func (c Config) Manager() (*Manager, error) {
 		return nil, err
 	}
 
+	mc, err := memberlist.New(c.initMembers, msgHandler, nodeLeveHandler)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Manager{
 		Config: c,
 		tm:     tm,
 		ipt:    ipt,
 		ipset:  ipset.New(),
 		router: router,
+		mc:     mc,
 	}, nil
 }
 
@@ -138,10 +144,32 @@ func (m *Manager) Start() {
 		}
 	}
 
+	// Connector broadcasts the active routing info to all cloud agents.
+	broadcastToAgents := func() {
+		cp, err := m.router.GetConnectorPrefixes()
+		if err != nil {
+			klog.Errorf("failed to get connector prefixes:%s", err)
+			return
+		}
+		klog.V(5).Infof("get connector prefixes:%+v", cp)
+
+		if len(cp.RemotePrefixes) < 1 || len(cp.LocalPrefixes) < 1 {
+			return
+		}
+
+		b, err := json.Marshal(cp)
+		if err != nil {
+			klog.Errorf("failed to marshal prefixes:%s", err)
+		}
+
+		m.mc.Broadcast(b)
+	}
+
 	tunnelTaskFn := func() {
 		if err := m.syncConnections(); err != nil {
 			klog.Errorf("error when to sync tunnels: %s", err)
 		} else {
+			broadcastToAgents()
 			klog.Infof("tunnels are synced")
 		}
 	}

@@ -16,16 +16,15 @@ package agent
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	ctrlpkg "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller"
-	handlerpkg "sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	"sigs.k8s.io/controller-runtime/pkg/source"
 
 	"github.com/fabedge/fabedge/pkg/operator/allocator"
 	storepkg "github.com/fabedge/fabedge/pkg/operator/store"
@@ -34,12 +33,17 @@ import (
 	nodeutil "github.com/fabedge/fabedge/pkg/util/node"
 )
 
+// errRestartAgent is used to signal controller put restartAgent in context
+var errRestartAgent = fmt.Errorf("restart agent")
+
 const (
 	controllerName              = "agent-controller"
 	agentConfigTunnelFileName   = "tunnels.yaml"
 	agentConfigServicesFileName = "services.yaml"
 	agentConfigTunnelsFilepath  = "/etc/fabedge/tunnels.yaml"
 	agentConfigServicesFilepath = "/etc/fabedge/services.yaml"
+
+	keyRestartAgent = "restartAgent"
 )
 
 type ObjectKey = client.ObjectKey
@@ -72,15 +76,16 @@ type Config struct {
 
 	GetConnectorEndpoint types.EndpointGetter
 	NewEndpoint          types.NewEndpointFunc
+	GetEndpointName      types.GetNameFunc
 
 	CertManager      certutil.Manager
 	CertOrganization string
-	CertValidPeriod  int64
 
-	EnableProxy          bool
-	EnableFlannelMocking bool
+	EnableProxy bool
 
-	EnableEdgeIPAM bool
+	EnableEdgeIPAM        bool
+	EnableEdgeHairpinMode bool
+	NetworkPluginMTU      int
 }
 
 func AddToManager(cnf Config) error {
@@ -95,44 +100,32 @@ func AddToManager(cnf Config) error {
 		edgeNameSet: types.NewSafeStringSet(),
 		handlers:    initHandlers(cnf, cli, log),
 	}
-	c, err := controller.New(
-		controllerName,
-		mgr,
-		controller.Options{
-			Reconciler: reconciler,
-		},
-	)
-	if err != nil {
-		return err
-	}
 
-	return c.Watch(
-		&source.Kind{Type: &corev1.Node{}},
-		&handlerpkg.EnqueueRequestForObject{},
-	)
+	return ctrlpkg.NewControllerManagedBy(mgr).
+		For(&corev1.Node{}).
+		Owns(&corev1.ConfigMap{}).
+		Owns(&corev1.Secret{}).
+		Owns(&corev1.Pod{}).
+		Named(controllerName).
+		Complete(reconciler)
 }
 
 func initHandlers(cnf Config, cli client.Client, log logr.Logger) []Handler {
 	var handlers []Handler
 	if cnf.Allocator != nil {
 		handlers = append(handlers, &allocatablePodCIDRsHandler{
-			store:       cnf.Store,
-			allocator:   cnf.Allocator,
-			newEndpoint: cnf.NewEndpoint,
-			client:      cli,
-			log:         log.WithName("podCIDRsHandler"),
+			store:           cnf.Store,
+			allocator:       cnf.Allocator,
+			newEndpoint:     cnf.NewEndpoint,
+			getEndpointName: cnf.GetEndpointName,
+			client:          cli,
+			log:             log.WithName("podCIDRsHandler"),
 		})
 	} else {
 		handlers = append(handlers, &rawPodCIDRsHandler{
-			store:       cnf.Store,
-			newEndpoint: cnf.NewEndpoint,
-		})
-	}
-
-	if cnf.EnableFlannelMocking {
-		handlers = append(handlers, &flannelNodeMocker{
-			client: cli,
-			log:    log,
+			store:           cnf.Store,
+			getEndpointName: cnf.GetEndpointName,
+			newEndpoint:     cnf.NewEndpoint,
 		})
 	}
 
@@ -140,6 +133,7 @@ func initHandlers(cnf Config, cli client.Client, log logr.Logger) []Handler {
 		namespace:            cnf.Namespace,
 		client:               cli,
 		store:                cnf.Store,
+		getEndpointName:      cnf.GetEndpointName,
 		getConnectorEndpoint: cnf.GetConnectorEndpoint,
 		log:                  log.WithName("configHandler"),
 	})
@@ -149,8 +143,8 @@ func initHandlers(cnf Config, cli client.Client, log logr.Logger) []Handler {
 		client:    cli,
 
 		certManager:      cnf.CertManager,
+		getEndpointName:  cnf.GetEndpointName,
 		certOrganization: cnf.CertOrganization,
-		certValidPeriod:  cnf.CertValidPeriod,
 
 		log: log.WithName("certHandler"),
 	})
@@ -160,14 +154,16 @@ func initHandlers(cnf Config, cli client.Client, log logr.Logger) []Handler {
 		client:    cli,
 		log:       log.WithName("agentPodHandler"),
 
-		imagePullPolicy: corev1.PullPolicy(cnf.ImagePullPolicy),
-		logLevel:        cnf.AgentLogLevel,
-		agentImage:      cnf.AgentImage,
-		strongswanImage: cnf.StrongswanImage,
-		useXfrm:         cnf.UseXfrm,
-		masqOutgoing:    cnf.MasqOutgoing,
-		enableProxy:     cnf.EnableProxy,
-		enableIPAM:      cnf.EnableEdgeIPAM,
+		imagePullPolicy:   corev1.PullPolicy(cnf.ImagePullPolicy),
+		logLevel:          cnf.AgentLogLevel,
+		agentImage:        cnf.AgentImage,
+		strongswanImage:   cnf.StrongswanImage,
+		useXfrm:           cnf.UseXfrm,
+		masqOutgoing:      cnf.MasqOutgoing,
+		enableProxy:       cnf.EnableProxy,
+		enableIPAM:        true,
+		enableHairpinMode: cnf.EnableEdgeHairpinMode,
+		networkPluginMTU:  cnf.NetworkPluginMTU,
 	})
 
 	return handlers
@@ -195,9 +191,13 @@ func (ctl *agentController) Reconcile(ctx context.Context, request reconcile.Req
 		return reconcile.Result{}, nil
 	}
 
-	ctl.edgeNameSet.Add(node.Name)
+	ctl.edgeNameSet.Insert(node.Name)
 	for _, handler := range ctl.handlers {
 		if err := handler.Do(ctx, node); err != nil {
+			if err == errRestartAgent {
+				ctx = context.WithValue(ctx, keyRestartAgent, err)
+				continue
+			}
 			return reconcile.Result{}, err
 		}
 	}
@@ -207,13 +207,11 @@ func (ctl *agentController) Reconcile(ctx context.Context, request reconcile.Req
 
 func (ctl *agentController) shouldSkip(node corev1.Node) bool {
 	ip := nodeutil.GetIP(node)
-	cidrs := nodeutil.GetPodCIDRs(node)
-
-	return len(ip) == 0 || len(cidrs) == 0
+	return len(ip) == 0
 }
 
 func (ctl *agentController) clearAllocatedResourcesForEdgeNode(ctx context.Context, nodeName string) error {
-	if !ctl.edgeNameSet.Contains(nodeName) {
+	if !ctl.edgeNameSet.Has(nodeName) {
 		return nil
 	}
 
@@ -224,6 +222,6 @@ func (ctl *agentController) clearAllocatedResourcesForEdgeNode(ctx context.Conte
 		}
 	}
 
-	ctl.edgeNameSet.Remove(nodeName)
+	ctl.edgeNameSet.Delete(nodeName)
 	return nil
 }

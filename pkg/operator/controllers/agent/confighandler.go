@@ -19,13 +19,16 @@ import (
 	"fmt"
 
 	"github.com/go-logr/logr"
-	"github.com/jjeffery/stringset"
 	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	apis "github.com/fabedge/fabedge/pkg/apis/v1alpha1"
 	"github.com/fabedge/fabedge/pkg/common/constants"
 	"github.com/fabedge/fabedge/pkg/common/netconf"
 	storepkg "github.com/fabedge/fabedge/pkg/operator/store"
@@ -37,6 +40,7 @@ var _ Handler = &configHandler{}
 type configHandler struct {
 	namespace            string
 	store                storepkg.Interface
+	getEndpointName      types.GetNameFunc
 	getConnectorEndpoint types.EndpointGetter
 	client               client.Client
 	log                  logr.Logger
@@ -83,6 +87,11 @@ func (handler *configHandler) Do(ctx context.Context, node corev1.Node) error {
 			},
 		}
 
+		if err = controllerutil.SetControllerReference(&node, configMap, scheme.Scheme); err != nil {
+			log.Error(err, "failed to set ownerReference to configmap")
+			return err
+		}
+
 		return handler.client.Create(ctx, configMap)
 	}
 
@@ -92,6 +101,11 @@ func (handler *configHandler) Do(ctx context.Context, node corev1.Node) error {
 	}
 
 	agentConfig.Data[agentConfigTunnelFileName] = configData
+	if err = controllerutil.SetControllerReference(&node, &agentConfig, scheme.Scheme); err != nil {
+		log.Error(err, "failed to set ownerReference to configmap")
+		return err
+	}
+
 	err = handler.client.Update(ctx, &agentConfig)
 	if err != nil {
 		log.Error(err, "failed to update agent configmap")
@@ -100,36 +114,38 @@ func (handler *configHandler) Do(ctx context.Context, node corev1.Node) error {
 	return err
 }
 
-func (handler *configHandler) buildNetworkConf(name string) netconf.NetworkConf {
+func (handler *configHandler) buildNetworkConf(nodeName string) netconf.NetworkConf {
 	store := handler.store
-	endpoint, _ := store.GetEndpoint(name)
-	peerEndpoints := handler.getPeers(name)
+
+	epName := handler.getEndpointName(nodeName)
+	endpoint, _ := store.GetEndpoint(epName)
+	peerEndpoints := handler.getPeers(epName)
 
 	conf := netconf.NetworkConf{
-		TunnelEndpoint: endpoint.ConvertToTunnelEndpoint(),
-		Peers:          make([]netconf.TunnelEndpoint, 0, len(peerEndpoints)),
+		Endpoint: endpoint,
+		Peers:    make([]apis.Endpoint, 0, len(peerEndpoints)),
 	}
 
 	for _, ep := range peerEndpoints {
-		conf.Peers = append(conf.Peers, ep.ConvertToTunnelEndpoint())
+		conf.Peers = append(conf.Peers, ep)
 	}
 
 	return conf
 }
 
-func (handler *configHandler) getPeers(name string) []types.Endpoint {
+func (handler *configHandler) getPeers(name string) []apis.Endpoint {
 	store := handler.store
-	nameSet := stringset.New()
+	nameSet := sets.NewString()
 
 	for _, community := range store.GetCommunitiesByEndpoint(name) {
-		nameSet.Add(community.Members.Values()...)
+		nameSet.Insert(community.Members.List()...)
 	}
-	nameSet.Remove(name)
+	nameSet.Delete(name)
 
-	endpoints := make([]types.Endpoint, 0, len(nameSet)+1)
+	endpoints := make([]apis.Endpoint, 0, len(nameSet)+1)
 	// always put connector endpoint first
 	endpoints = append(endpoints, handler.getConnectorEndpoint())
-	endpoints = append(endpoints, store.GetEndpoints(nameSet.Values()...)...)
+	endpoints = append(endpoints, store.GetEndpoints(nameSet.List()...)...)
 
 	return endpoints
 }

@@ -25,7 +25,9 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/fabedge/fabedge/pkg/common/constants"
 	secretutil "github.com/fabedge/fabedge/pkg/util/secret"
@@ -36,14 +38,16 @@ var _ Handler = &agentPodHandler{}
 type agentPodHandler struct {
 	namespace string
 
-	logLevel        int
-	agentImage      string
-	strongswanImage string
-	imagePullPolicy corev1.PullPolicy
-	useXfrm         bool
-	masqOutgoing    bool
-	enableProxy     bool
-	enableIPAM      bool
+	logLevel          int
+	agentImage        string
+	strongswanImage   string
+	imagePullPolicy   corev1.PullPolicy
+	useXfrm           bool
+	masqOutgoing      bool
+	enableProxy       bool
+	enableIPAM        bool
+	enableHairpinMode bool
+	networkPluginMTU  int
 
 	client client.Client
 	log    logr.Logger
@@ -58,14 +62,19 @@ func (handler *agentPodHandler) Do(ctx context.Context, node corev1.Node) error 
 	err := handler.client.Get(ctx, ObjectKey{Name: agentPodName, Namespace: handler.namespace}, &oldPod)
 	switch {
 	case err == nil:
-		newPod := handler.buildAgentPod(handler.namespace, node.Name, agentPodName)
-		if newPod.Labels[constants.KeyPodHash] == oldPod.Labels[constants.KeyPodHash] {
+		needRestart := ctx.Value(keyRestartAgent) == errRestartAgent
+		if !needRestart {
+			newPod := handler.buildAgentPod(handler.namespace, node.Name, agentPodName)
+			needRestart = newPod.Labels[constants.KeyPodHash] != oldPod.Labels[constants.KeyPodHash]
+		}
+
+		if !needRestart {
 			return nil
 		}
 
 		// we will not create agent pod now because pod termination may last for a long time,
 		// during that time, create pod may get collision error
-		log.V(3).Info("agent pod may be out of date, delete it")
+		log.V(3).Info("need to restart pod, delete it now")
 		err = handler.client.Delete(context.TODO(), &oldPod)
 		if err != nil {
 			log.Error(err, "failed to delete agent pod")
@@ -74,6 +83,12 @@ func (handler *agentPodHandler) Do(ctx context.Context, node corev1.Node) error 
 	case errors.IsNotFound(err):
 		log.V(5).Info("Agent pod is not found, create it now")
 		newPod := handler.buildAgentPod(handler.namespace, node.Name, agentPodName)
+
+		if err = controllerutil.SetControllerReference(&node, newPod, scheme.Scheme); err != nil {
+			log.Error(err, "failed to set ownerReference to TLS secret")
+			return err
+		}
+
 		err = handler.client.Create(ctx, newPod)
 		if err != nil {
 			log.Error(err, "failed to create agent pod")
@@ -126,6 +141,8 @@ func (handler *agentPodHandler) buildAgentPod(namespace, nodeName, podName strin
 						"tls.crt",
 						fmt.Sprintf("--masq-outgoing=%t", handler.masqOutgoing),
 						fmt.Sprintf("--enable-ipam=%t", handler.enableIPAM),
+						fmt.Sprintf("--enable-hairpinmode=%t", handler.enableHairpinMode),
+						fmt.Sprintf("--network-plugin-mtu=%d", handler.networkPluginMTU),
 						fmt.Sprintf("--use-xfrm=%t", handler.useXfrm),
 						fmt.Sprintf("--enable-proxy=%t", handler.enableProxy),
 						fmt.Sprintf("-v=%d", handler.logLevel),
@@ -302,7 +319,7 @@ func (handler *agentPodHandler) buildEnvPrepareContainer() corev1.Container {
 	return corev1.Container{
 		Name:            "environment-prepare",
 		Image:           handler.agentImage,
-		ImagePullPolicy: corev1.PullIfNotPresent,
+		ImagePullPolicy: handler.imagePullPolicy,
 		Command: []string{
 			"env_prepare.sh",
 		},

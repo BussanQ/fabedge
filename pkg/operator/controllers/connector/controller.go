@@ -16,15 +16,16 @@ package connector
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/jjeffery/stringset"
 	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	controllerpkg "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -32,11 +33,14 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
+	apis "github.com/fabedge/fabedge/pkg/apis/v1alpha1"
 	"github.com/fabedge/fabedge/pkg/common/constants"
 	"github.com/fabedge/fabedge/pkg/common/netconf"
 	storepkg "github.com/fabedge/fabedge/pkg/operator/store"
 	"github.com/fabedge/fabedge/pkg/operator/types"
+	certutil "github.com/fabedge/fabedge/pkg/util/cert"
 	nodeutil "github.com/fabedge/fabedge/pkg/util/node"
+	secretutil "github.com/fabedge/fabedge/pkg/util/secret"
 )
 
 const (
@@ -50,12 +54,15 @@ type Node struct {
 }
 
 type Config struct {
-	Endpoint        types.Endpoint
+	Namespace       string
+	Endpoint        apis.Endpoint
 	ProvidedSubnets []string
 	GetPodCIDRs     types.PodCIDRsGetter
+	CertManager     certutil.Manager
+	ConnectorLabels map[string]string
 
-	ConfigMapKey client.ObjectKey
-	SyncInterval time.Duration
+	CertOrganization string
+	SyncInterval     time.Duration
 
 	Store   storepkg.Interface
 	Manager manager.Manager
@@ -69,18 +76,22 @@ type controller struct {
 	client client.Client
 	log    logr.Logger
 
-	nodeNameSet stringset.Set
+	nodeNameSet sets.String
 	nodeCache   map[string]Node
 	mux         sync.RWMutex
 }
 
 func AddToManager(cnf Config) (types.EndpointGetter, error) {
+	if len(cnf.ConnectorLabels) == 0 {
+		return nil, fmt.Errorf("connector labels is needed")
+	}
+
 	mgr := cnf.Manager
 
 	ctl := &controller{
 		Config: cnf,
 
-		nodeNameSet: stringset.New(),
+		nodeNameSet: sets.NewString(),
 		nodeCache:   make(map[string]Node),
 		client:      mgr.GetClient(),
 		log:         mgr.GetLogger().WithName(controllerName),
@@ -116,27 +127,39 @@ func AddToManager(cnf Config) (types.EndpointGetter, error) {
 func (ctl *controller) SyncConnectorConfig(ctx context.Context) error {
 	tick := time.NewTicker(ctl.SyncInterval)
 
-	ctl.updateConfigMapIfNeeded()
+	ctl.operateConnector()
 	for {
 		select {
 		case <-tick.C:
-			ctl.updateConfigMapIfNeeded()
+			ctl.operateConnector()
 		case <-ctx.Done():
 			return nil
 		}
 	}
 }
 
+func (ctl *controller) operateConnector() {
+	ctl.updateConfigMapIfNeeded()
+	generated := ctl.generateCertIfNeeded()
+	if generated {
+		ctl.restartConnectorPods()
+	}
+}
+
 func (ctl *controller) updateConfigMapIfNeeded() {
-	log := ctl.log.WithValues("key", ctl.ConfigMapKey)
+	key := client.ObjectKey{
+		Name:      constants.ConnectorConfigName,
+		Namespace: ctl.Namespace,
+	}
+	log := ctl.log.WithValues("key", key)
 
 	ctx, cancel := context.WithTimeout(context.Background(), ctl.SyncInterval)
 	defer cancel()
 
 	connectorEndpoint := ctl.getConnectorEndpoint()
 	conf := netconf.NetworkConf{
-		TunnelEndpoint: connectorEndpoint.ConvertToTunnelEndpoint(),
-		Peers:          ctl.getPeers(),
+		Endpoint: connectorEndpoint,
+		Peers:    ctl.getPeers(),
 	}
 
 	confBytes, err := yaml.Marshal(conf)
@@ -148,7 +171,7 @@ func (ctl *controller) updateConfigMapIfNeeded() {
 	configData := string(confBytes)
 
 	var cm corev1.ConfigMap
-	err = ctl.client.Get(ctx, ctl.ConfigMapKey, &cm)
+	err = ctl.client.Get(ctx, key, &cm)
 	if err != nil && !errors.IsNotFound(err) {
 		log.Error(err, "failed to get connector configmap")
 		return
@@ -159,8 +182,8 @@ func (ctl *controller) updateConfigMapIfNeeded() {
 
 		cm = corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      ctl.ConfigMapKey.Name,
-				Namespace: ctl.ConfigMapKey.Namespace,
+				Name:      key.Name,
+				Namespace: key.Namespace,
 			},
 			Data: map[string]string{
 				constants.ConnectorConfigFileName: configData,
@@ -184,13 +207,119 @@ func (ctl *controller) updateConfigMapIfNeeded() {
 	}
 }
 
-func (ctl *controller) getPeers() []netconf.TunnelEndpoint {
-	nameSet := ctl.Store.GetAllEndpointNames()
-	endpoints := ctl.Store.GetEndpoints(nameSet.Values()...)
+func (ctl *controller) generateCertIfNeeded() bool {
+	key := client.ObjectKey{
+		Name:      constants.ConnectorTLSName,
+		Namespace: ctl.Namespace,
+	}
+	log := ctl.log.WithValues("key", key)
 
-	peers := make([]netconf.TunnelEndpoint, 0, len(endpoints))
+	ctx, cancel := context.WithTimeout(context.Background(), ctl.SyncInterval)
+	defer cancel()
+
+	var secret corev1.Secret
+	err := ctl.client.Get(ctx, key, &secret)
+	if err != nil {
+		if !errors.IsNotFound(err) {
+			ctl.log.Error(err, "failed to get secret")
+			return false
+		}
+
+		log.V(5).Info("TLS secret for connector is not found, generate it now")
+		secret, err = ctl.buildCertAndKeySecret(key)
+		if err != nil {
+			log.Error(err, "failed to create cert and key for connector")
+			return false
+		}
+
+		err = ctl.client.Create(ctx, &secret)
+		if err != nil {
+			log.Error(err, "failed to create secret")
+			return false
+		}
+
+		return true
+	}
+
+	certPEM := secretutil.GetCert(secret)
+	err = ctl.CertManager.VerifyCertInPEM(certPEM, certutil.ExtKeyUsagesServerAndClient)
+	if err == nil {
+		log.V(5).Info("cert is verified")
+		return false
+	}
+
+	log.Error(err, "failed to verify cert, need to regenerate a cert for connector")
+	secret, err = ctl.buildCertAndKeySecret(key)
+	if err != nil {
+		log.Error(err, "failed to recreate cert and key for connector")
+		return false
+	}
+
+	err = ctl.client.Update(ctx, &secret)
+	if err != nil {
+		log.Error(err, "failed to save secret")
+		return false
+	}
+
+	return true
+}
+
+func (ctl *controller) restartConnectorPods() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	var podList corev1.PodList
+	if err := ctl.client.List(ctx, &podList, client.MatchingLabels(ctl.ConnectorLabels)); err != nil {
+		ctl.log.Error(err, "failed to list connector pods")
+		return
+	}
+
+	for _, pod := range podList.Items {
+		if err := ctl.client.Delete(ctx, &pod); err != nil {
+			ctl.log.Error(err, "failed to delete connector")
+		}
+	}
+}
+
+func (ctl *controller) buildCertAndKeySecret(key client.ObjectKey) (corev1.Secret, error) {
+	keyDER, csr, err := certutil.NewCertRequest(certutil.Request{
+		CommonName:   ctl.Endpoint.Name,
+		Organization: []string{ctl.CertOrganization},
+	})
+	if err != nil {
+		return corev1.Secret{}, err
+	}
+
+	certDER, err := ctl.CertManager.SignCert(csr)
+	if err != nil {
+		return corev1.Secret{}, err
+	}
+
+	return secretutil.TLSSecret().
+		Name(key.Name).
+		Namespace(key.Namespace).
+		EncodeCert(certDER).
+		EncodeKey(keyDER).
+		CACertPEM(ctl.CertManager.GetCACertPEM()).
+		Label(constants.KeyCreatedBy, constants.AppOperator).Build(), nil
+}
+
+func (ctl *controller) getPeers() []apis.Endpoint {
+	connectorName := ctl.Endpoint.Name
+
+	nameSet := ctl.Store.GetLocalEndpointNames()
+	for _, community := range ctl.Store.GetCommunitiesByEndpoint(connectorName) {
+		for name := range community.Members {
+			nameSet.Insert(name)
+		}
+	}
+	nameSet.Delete(connectorName)
+
+	endpoints := ctl.Store.GetEndpoints(nameSet.List()...)
+
+	peers := make([]apis.Endpoint, 0, len(endpoints))
 	for _, ep := range endpoints {
-		peers = append(peers, ep.ConvertToTunnelEndpoint())
+		peers = append(peers, ep)
 	}
 
 	return peers
@@ -229,11 +358,11 @@ func (ctl *controller) addNode(node corev1.Node, rebuild bool) {
 
 	ctl.mux.Lock()
 	defer ctl.mux.Unlock()
-	if ctl.nodeNameSet.Contains(node.Name) {
+	if ctl.nodeNameSet.Has(node.Name) {
 		return
 	}
 
-	ctl.nodeNameSet.Add(node.Name)
+	ctl.nodeNameSet.Insert(node.Name)
 	ctl.nodeCache[node.Name] = Node{
 		Name:     node.Name,
 		IP:       ip,
@@ -249,11 +378,11 @@ func (ctl *controller) removeNode(nodeName string) {
 	ctl.mux.Lock()
 	defer ctl.mux.Unlock()
 
-	if !ctl.nodeNameSet.Contains(nodeName) {
+	if !ctl.nodeNameSet.Has(nodeName) {
 		return
 	}
 
-	ctl.nodeNameSet.Remove(nodeName)
+	ctl.nodeNameSet.Delete(nodeName)
 	delete(ctl.nodeCache, nodeName)
 
 	ctl.rebuildConnectorEndpoint()
@@ -286,7 +415,7 @@ func (ctl *controller) rebuildConnectorEndpoint() {
 	nodeSubnets := make([]string, 0, len(ctl.nodeCache))
 
 	subnets = append(subnets, ctl.ProvidedSubnets...)
-	for _, nodeName := range ctl.nodeNameSet.Values() {
+	for _, nodeName := range ctl.nodeNameSet.List() {
 		node := ctl.nodeCache[nodeName]
 
 		subnets = append(subnets, node.PodCIDRs...)
@@ -295,9 +424,11 @@ func (ctl *controller) rebuildConnectorEndpoint() {
 
 	ctl.Endpoint.Subnets = subnets
 	ctl.Endpoint.NodeSubnets = nodeSubnets
+	ctl.Endpoint.Type = apis.Connector
+	ctl.Store.SaveEndpointAsLocal(ctl.Endpoint)
 }
 
-func (ctl *controller) getConnectorEndpoint() types.Endpoint {
+func (ctl *controller) getConnectorEndpoint() apis.Endpoint {
 	ctl.mux.RLock()
 	defer ctl.mux.RUnlock()
 
